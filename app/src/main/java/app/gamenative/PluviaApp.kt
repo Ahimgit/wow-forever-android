@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.navigation.NavController
 import app.gamenative.events.EventDispatcher
+import app.gamenative.service.GameSessionService
 import app.gamenative.ui.screen.xserver.RadialMenuCoordinator
 import android.app.Application
 import com.winlator.container.Container
@@ -63,9 +64,15 @@ class PluviaApp : Application() {
         var imeInputReceiver: app.gamenative.externaldisplay.IMEInputReceiver? = null
         var radialMenuCoordinator: RadialMenuCoordinator? = null
 
+        // Also holds GameSessionService in the foreground while a game process is alive
         @JvmStatic
         @Volatile
         var keepAlive: Boolean = false
+            set(value) {
+                if (field == value) return
+                field = value
+                if (value) GameSessionService.start(instance) else GameSessionService.stop(instance)
+            }
 
         var isOverlayPaused by mutableStateOf(false)
         @Volatile

@@ -28,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
@@ -36,7 +37,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.LifecycleResumeEffect
-import app.gamenative.BuildConfig
 import app.gamenative.PluviaApp
 import app.gamenative.events.AndroidEvent
 import app.gamenative.ui.screen.wow.WowClientDownloader.BUILD_INFO
@@ -51,9 +51,7 @@ import app.gamenative.ui.theme.WowError
 import app.gamenative.ui.theme.WowGold
 import app.gamenative.ui.theme.WowMuted
 import app.gamenative.ui.theme.WowSubtle
-import app.gamenative.utils.AppUpdater
 import app.gamenative.utils.StorageUtils
-import app.gamenative.utils.renderReleaseNotes
 import com.winlator.container.Container
 import com.winlator.container.ContainerManager
 import com.winlator.contents.ContentProfile
@@ -68,7 +66,6 @@ import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -92,6 +89,9 @@ fun WoWForeverScreen(
     val gpu = remember { GpuProfile.detect(context) }
 
     var gamePath by remember { mutableStateOf(GamePath.load(context)) }
+    var resolution by remember { mutableStateOf(Resolution.load(context)) }
+    // Re-read on configuration changes so folding or unfolding updates the offered resolutions.
+    val (windowWidth, windowHeight) = remember(LocalConfiguration.current) { windowSize(context) }
     var files by remember { mutableStateOf(GamePath.Status()) }
     var isLaunching by remember { mutableStateOf(false) }
     var launchJob by remember { mutableStateOf<Job?>(null) }
@@ -104,62 +104,7 @@ fun WoWForeverScreen(
     var isCheckingVersion by remember { mutableStateOf(false) }
     var isUpdating by remember { mutableStateOf(false) }
     var updateStatusText by remember { mutableStateOf("") }
-    var appUpdate by remember { mutableStateOf<AppUpdater.Release?>(null) }
-    var isDownloadingAppUpdate by remember { mutableStateOf(false) }
-    var appUpdateProgress by remember { mutableFloatStateOf(0f) }
-    var showAppUpdateDialog by remember { mutableStateOf(false) }
-    var showAppUpdatePermissionDialog by remember { mutableStateOf(false) }
-    var pendingInstallPermission by remember { mutableStateOf(false) }
-    var downloadedApk by remember { mutableStateOf<File?>(null) }
     var showUpgradeDialog by remember { mutableStateOf(false) }
-
-    suspend fun fetchAppUpdate(): AppUpdater.Release? {
-        val release = AppUpdater.check()
-        appUpdate = release
-        if (release != null) {
-            showAppUpdateDialog = true
-        }
-        return release
-    }
-
-    fun checkAppUpdate() {
-        scope.launch { fetchAppUpdate() }
-    }
-
-    fun installOrRequestPermission(apk: File) {
-        if (AppUpdater.canInstall(context)) {
-            AppUpdater.install(context, apk)
-        } else {
-            pendingInstallPermission = true
-            showAppUpdatePermissionDialog = true
-        }
-    }
-
-    fun performAppUpdate() {
-        val target = appUpdate ?: return
-        if (isDownloadingAppUpdate) return
-        downloadedApk?.takeIf { it.exists() && it.length() == target.sizeBytes }?.let { apk ->
-            installOrRequestPermission(apk)
-            return
-        }
-        isDownloadingAppUpdate = true
-        appUpdateProgress = 0f
-        errorMessage = null
-        scope.launch {
-            try {
-                val apk = AppUpdater.download(context, target) { progress ->
-                    appUpdateProgress = progress
-                }
-                downloadedApk = apk
-                isDownloadingAppUpdate = false
-                installOrRequestPermission(apk)
-            } catch (e: Exception) {
-                Timber.e(e, "Error downloading app update")
-                errorMessage = "App update download failed: ${e.message}"
-                isDownloadingAppUpdate = false
-            }
-        }
-    }
 
     suspend fun fetchVersionStatus() {
         isCheckingVersion = true
@@ -204,8 +149,8 @@ fun WoWForeverScreen(
 
         launchJob = scope.launch {
             try {
-                val screenSize = fitScreenSizeToWindow(context, gpu.screenSize)
                 val containerId = withContext(Dispatchers.IO) {
+                    val screenSize = Resolution.resolve(resolution, gpu.screenSize, windowWidth, windowHeight)
                     prepareLaunch(context, File(gamePath), gpu, screenSize) { msg ->
                         scope.launch(Dispatchers.Main) { statusText = msg }
                     }
@@ -236,13 +181,6 @@ fun WoWForeverScreen(
         BattleNetSignIn.removeLoginFile(File(gamePath))
         if (versionStatus == null && !WoWLauncherState.shouldAutoLaunch) {
             checkVersionStatus()
-        }
-        if (appUpdate == null && !WoWLauncherState.shouldAutoLaunch) {
-            checkAppUpdate()
-        }
-        if (pendingInstallPermission && AppUpdater.canInstall(context)) {
-            pendingInstallPermission = false
-            downloadedApk?.takeIf { it.exists() }?.let { AppUpdater.install(context, it) }
         }
         onPauseOrDispose {
             launchJob?.cancel()
@@ -351,20 +289,16 @@ fun WoWForeverScreen(
                 if (files.isLegacyBeta) showUpgradeDialog = true
                 if (ready) {
                     checkVersionStatus()
-                    checkAppUpdate()
                 }
             }
             !WoWLauncherState.shouldAutoLaunch -> {
                 checkVersionStatus()
-                checkAppUpdate()
             }
             else -> {
-                val updateJob = async { fetchAppUpdate() }
                 fetchVersionStatus()
-                val update = updateJob.await()
-                Timber.i("WoWForeverScreen LaunchedEffect: isOutdated=${versionStatus?.isOutdated}, appUpdate=$update")
+                Timber.i("WoWForeverScreen LaunchedEffect: isOutdated=${versionStatus?.isOutdated}")
                 WoWLauncherState.shouldAutoLaunch = false
-                if (versionStatus?.isOutdated == true || update != null) {
+                if (versionStatus?.isOutdated == true) {
                     PluviaApp.events.emit(AndroidEvent.ClearBootingSplash)
                 } else {
                     launchGame()
@@ -436,15 +370,6 @@ fun WoWForeverScreen(
                             label = if (hasSavedLogin) "Battle.net Login (Configured)" else "Battle.net Login (Configure below play button)",
                             ready = hasSavedLogin,
                         )
-                        appUpdate?.let {
-                            CheckItem(
-                                label = "App Build: v${BuildConfig.VERSION_NAME} (v${it.version} available)",
-                                ready = false,
-                            )
-                        } ?: CheckItem(
-                            label = "App Build: v${BuildConfig.VERSION_NAME}",
-                            ready = true,
-                        )
                         versionStatus?.let { version ->
                             CheckItem(
                                 label = if (version.isOutdated) {
@@ -462,6 +387,18 @@ fun WoWForeverScreen(
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Text(text = "Target Path: $gamePath", fontSize = 11.sp, color = WowSubtle, maxLines = 2)
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    ResolutionPicker(
+                        selected = resolution,
+                        autoSize = fitScreenSize(gpu.screenSize, windowWidth, windowHeight),
+                        options = Resolution.options(windowWidth, windowHeight),
+                        enabled = !isLaunching && !isUpdating,
+                        onSelect = {
+                            resolution = it
+                            Resolution.save(context, it)
+                        },
+                    )
 
                     errorMessage?.let {
                         Spacer(modifier = Modifier.height(10.dp))
@@ -508,49 +445,6 @@ fun WoWForeverScreen(
                             text = "Tap Update below to download the latest files directly from Blizzard's CDN over Wi-Fi.",
                             fontSize = 11.sp,
                             color = Color(0xFFCBD5E1)
-                        )
-                    }
-                }
-            }
-
-            appUpdate?.let { update ->
-                Spacer(modifier = Modifier.height(16.dp))
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth(0.9f)
-                        .border(1.dp, WowGold.copy(alpha = 0.6f), RoundedCornerShape(16.dp)),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1E2838).copy(alpha = 0.85f)),
-                    shape = RoundedCornerShape(16.dp),
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Refresh, contentDescription = null, tint = WowGold, modifier = Modifier.size(20.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            SectionTitle("APP UPDATE AVAILABLE (v${update.version})", WowGold)
-                        }
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "A new release is available on GitHub. Tap below to view notes and update.",
-                            fontSize = 12.sp,
-                            color = Color(0xFFCBD5E1),
-                            lineHeight = 16.sp,
-                        )
-                        Spacer(modifier = Modifier.height(10.dp))
-                        PrimaryButton(
-                            text = when {
-                                isDownloadingAppUpdate -> "DOWNLOADING UPDATE..."
-                                downloadedApk?.exists() == true -> "INSTALL UPDATE (v${update.version})"
-                                else -> "UPDATE APP (v${update.version})"
-                            },
-                            icon = Icons.Default.Refresh,
-                            enabled = !isDownloadingAppUpdate && !isLaunching && !isUpdating,
-                            onClick = {
-                                if (downloadedApk?.exists() == true) {
-                                    performAppUpdate()
-                                } else {
-                                    showAppUpdateDialog = true
-                                }
-                            },
                         )
                     }
                 }
@@ -635,7 +529,6 @@ fun WoWForeverScreen(
                         LinkButton("Refresh Status", Icons.Default.Refresh) {
                             checkFiles()
                             checkVersionStatus()
-                            checkAppUpdate()
                         }
                         if (!files.needsInstall) {
                             LinkButton("Change Location", Icons.Default.FolderOpen) { folderPicker.launch(null) }
@@ -740,123 +633,6 @@ fun WoWForeverScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showStoragePermissionDialog = false }) {
-                    Text("CANCEL", color = WowMuted)
-                }
-            },
-            containerColor = Color(0xFF1B2838),
-            shape = RoundedCornerShape(16.dp),
-        )
-    }
-
-    if (showAppUpdateDialog) {
-        appUpdate?.let { update ->
-            AlertDialog(
-                onDismissRequest = {
-                    if (!isDownloadingAppUpdate) showAppUpdateDialog = false
-                },
-                title = {
-                    Text(
-                        text = "App Update Available (v${update.version})",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 17.sp,
-                        color = WowGold,
-                    )
-                },
-                text = {
-                    Column {
-                        if (update.notes.isNotBlank()) {
-                            Text(
-                                text = renderReleaseNotes(update.notes),
-                                fontSize = 12.sp,
-                                color = Color(0xFFCBD5E1),
-                                lineHeight = 16.sp,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .heightIn(max = 240.dp)
-                                    .verticalScroll(rememberScrollState()),
-                            )
-                            Spacer(modifier = Modifier.height(16.dp))
-                        }
-                        if (isDownloadingAppUpdate) {
-                            Text(
-                                text = "Downloading: ${(appUpdateProgress * 100).toInt()}%",
-                                fontSize = 12.sp,
-                                color = WowGold,
-                                fontWeight = FontWeight.Bold,
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            LinearProgressIndicator(
-                                progress = { appUpdateProgress },
-                                modifier = Modifier.fillMaxWidth(),
-                                color = WowGold,
-                            )
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = ::performAppUpdate,
-                        enabled = !isDownloadingAppUpdate,
-                        colors = ButtonDefaults.buttonColors(containerColor = WowBronze, contentColor = Color.White),
-                        shape = RoundedCornerShape(10.dp),
-                    ) {
-                        Text(
-                            text = when {
-                                isDownloadingAppUpdate -> "DOWNLOADING..."
-                                downloadedApk?.exists() == true -> "INSTALL NOW"
-                                else -> "UPDATE NOW"
-                            },
-                            fontWeight = FontWeight.Bold,
-                        )
-                    }
-                },
-                dismissButton = {
-                    if (!isDownloadingAppUpdate) {
-                        TextButton(onClick = { showAppUpdateDialog = false }) {
-                            Text("LATER", color = WowMuted)
-                        }
-                    }
-                },
-                containerColor = Color(0xFF1B2838),
-                shape = RoundedCornerShape(16.dp),
-            )
-        }
-    }
-
-    if (showAppUpdatePermissionDialog) {
-        AlertDialog(
-            onDismissRequest = { showAppUpdatePermissionDialog = false },
-            title = {
-                Text(
-                    text = "Install Permission Required",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 17.sp,
-                    color = WowGold,
-                )
-            },
-            text = {
-                Text(
-                    text = "Android requires permission to install apps from WoW Forever.\n\nPlease enable 'Allow from this source' on the next screen.",
-                    fontSize = 13.sp,
-                    color = Color(0xFFE2E8F0),
-                    lineHeight = 18.sp,
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showAppUpdatePermissionDialog = false
-                        pendingInstallPermission = true
-                        AppUpdater.openInstallPermissionSettings(context)
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = WowBronze, contentColor = Color.White),
-                    shape = RoundedCornerShape(10.dp),
-                ) {
-                    Text("OPEN SETTINGS", fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showAppUpdatePermissionDialog = false }) {
                     Text("CANCEL", color = WowMuted)
                 }
             },
@@ -978,6 +754,77 @@ private fun InstallCard(isUpgrade: Boolean, gamePath: String, freeSpaceBytes: Lo
     }
 }
 
+object Resolution {
+    private const val PREFS = "wow_forever"
+    private const val KEY_RESOLUTION = "resolution"
+
+    const val AUTO = "auto"
+
+    // Heights offered below native; widths follow the window's aspect ratio.
+    private val STEP_HEIGHTS = listOf(720, 800, 900, 1080, 1200, 1440, 1600, 1800, 2160)
+
+    fun load(context: Context): String =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_RESOLUTION, null) ?: AUTO
+
+    fun save(context: Context, resolution: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_RESOLUTION, resolution).apply()
+    }
+
+    /** Fixed resolutions matching the window's aspect ratio, ending with the window's native size. */
+    fun options(windowWidth: Int, windowHeight: Int): List<String> {
+        if (windowWidth <= 0 || windowHeight <= 0) return emptyList()
+        val nativeWidth = maxOf(windowWidth, windowHeight)
+        val nativeHeight = minOf(windowWidth, windowHeight)
+        val aspect = nativeWidth.toFloat() / nativeHeight
+        val steps = STEP_HEIGHTS.filter { it < nativeHeight }.map { "${(it * aspect / 2).roundToInt() * 2}x$it" }
+        return steps + "${nativeWidth}x$nativeHeight"
+    }
+
+    /** Resolves [selected] to a concrete size; Auto, or a size saved for another aspect ratio, uses the GPU's pixel budget. */
+    fun resolve(selected: String, baseSize: String, windowWidth: Int, windowHeight: Int): String =
+        selected.takeIf { it in options(windowWidth, windowHeight) } ?: fitScreenSize(baseSize, windowWidth, windowHeight)
+}
+
+private fun windowSize(context: Context): Pair<Int, Int> =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        context.getSystemService(WindowManager::class.java).currentWindowMetrics.bounds.let { it.width() to it.height() }
+    } else {
+        context.resources.displayMetrics.let { it.widthPixels to it.heightPixels }
+    }
+
+@Composable
+private fun ResolutionPicker(selected: String, autoSize: String, options: List<String>, enabled: Boolean, onSelect: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val current = selected.takeIf { it in options } ?: Resolution.AUTO
+    fun label(option: String) = when (option) {
+        Resolution.AUTO -> "Auto (${autoSize.replace("x", " × ")})"
+        options.last() -> "${option.replace("x", " × ")} (native)"
+        else -> option.replace("x", " × ")
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(text = "Resolution:", fontSize = 11.sp, color = WowSubtle)
+        Spacer(modifier = Modifier.width(4.dp))
+        Box {
+            TextButton(onClick = { expanded = true }, enabled = enabled) {
+                Text(text = "${label(current)} ▾", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = WowGold)
+            }
+            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                (listOf(Resolution.AUTO) + options).forEach { option ->
+                    DropdownMenuItem(
+                        text = {
+                            Text(label(option), fontWeight = if (option == current) FontWeight.Bold else FontWeight.Normal)
+                        },
+                        onClick = {
+                            expanded = false
+                            onSelect(option)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun SectionTitle(text: String, color: Color) {
     Text(text = text, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, color = color)
@@ -1031,6 +878,7 @@ private const val ADRENO_8XX_DRIVER = "Turnip-V32-RP6sched"
 private const val PROTON_VERSION = "proton-11.0-90624-arm64ec"
 private const val DXVK_VERSION = "2.4.1-wow-aarch64-test"
 
+// screenSize is the 16:9 pixel budget that Auto reshapes to the window's aspect ratio.
 private data class GpuProfile(val driver: String, val tuDebug: String, val screenSize: String, val label: String, val edition: String) {
     companion object {
         fun detect(context: Context) = if (isAdreno8xxDevice(context)) {
@@ -1050,20 +898,6 @@ private data class GpuProfile(val driver: String, val tuDebug: String, val scree
     }
 }
 
-/**
- * Reshapes the GPU's 16:9 render budget to the current window's aspect ratio so the game fills
- * non-16:9 screens (e.g. a foldable's near-square inner display) instead of being letterboxed.
- * The pixel count stays the same as [baseSize], so GPU cost matches the 16:9 default.
- */
-private fun fitScreenSizeToWindow(context: Context, baseSize: String): String {
-    val (windowWidth, windowHeight) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        context.getSystemService(WindowManager::class.java).currentWindowMetrics.bounds.let { it.width() to it.height() }
-    } else {
-        context.resources.displayMetrics.let { it.widthPixels to it.heightPixels }
-    }
-    return fitScreenSize(baseSize, windowWidth, windowHeight)
-}
-
 internal fun fitScreenSize(baseSize: String, windowWidth: Int, windowHeight: Int): String {
     if (windowWidth <= 0 || windowHeight <= 0) return baseSize
     val (baseWidth, baseHeight) = baseSize.split("x").map { it.toInt() }
@@ -1073,12 +907,12 @@ internal fun fitScreenSize(baseSize: String, windowWidth: Int, windowHeight: Int
     return "${(width / 2).roundToInt() * 2}x${(height / 2).roundToInt() * 2}"
 }
 
-private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, screenSize: String, onStatus: (String) -> Unit): String {
+private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, resolution: String, onStatus: (String) -> Unit): String {
     installBundledComponents(context, onStatus)
 
     check(File(gameRoot, BUILD_INFO).exists()) { "Missing $BUILD_INFO in $gameRoot. Copy it from your WoW install." }
     try {
-        ensureGameConfig(gameRoot, screenSize)
+        ensureGameConfig(gameRoot, resolution)
     } catch (e: Exception) {
         if (e.isPermissionDenied()) throw StorageAccessDeniedException(e)
         throw e
@@ -1100,7 +934,7 @@ private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, scr
 
     onStatus("Configuring ${gpu.label} container...")
     val containerManager = ContainerManager(context)
-    val config = containerConfig(gameRoot, gpu, screenSize)
+    val config = containerConfig(gameRoot, gpu, resolution)
     val container = containerManager.getContainerById(CONTAINER_ID)
     if (container == null) {
         onStatus("Creating prefix environment (first boot)...")
@@ -1113,13 +947,13 @@ private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, scr
     return CONTAINER_ID
 }
 
-private fun containerConfig(gameRoot: File, gpu: GpuProfile, screenSize: String): JSONObject {
+private fun containerConfig(gameRoot: File, gpu: GpuProfile, resolution: String): JSONObject {
     val samsungEnv = if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) " FD_DEV_FEATURES=enable_tp_ubwc_flag_hint=1" else ""
     val envVars = "WRAPPER_MAX_IMAGE_COUNT=0 ZINK_DESCRIPTORS=lazy ZINK_DEBUG=compact,deck_emu MESA_SHADER_CACHE_DISABLE=false MESA_SHADER_CACHE_MAX_SIZE=512MB mesa_glthread=true WINEESYNC=0 MESA_VK_WSI_PRESENT_MODE=mailbox TU_DEBUG=${gpu.tuDebug} VKD3D_SHADER_MODEL=6_0 PULSE_LATENCY_MSEC=144$samsungEnv"
     return JSONObject().apply {
         put("id", CONTAINER_ID)
         put("name", "WoW Forever")
-        put("screenSize", screenSize)
+        put("screenSize", resolution)
         put("envVars", envVars)
         put("graphicsDriver", "Wrapper")
         put("graphicsDriverVersion", gpu.driver)
@@ -1135,6 +969,7 @@ private fun containerConfig(gameRoot: File, gpu: GpuProfile, screenSize: String)
         put("execArgs", "-d3d11")
         put("showFPS", true)
         put("startupSelection", Container.STARTUP_SELECTION_AGGRESSIVE.toInt())
+        put("suspendPolicy", Container.SUSPEND_POLICY_NEVER)
         put("wow64Mode", true)
         put("wincomponents", "direct3d=0,directsound=0,directinput8=0,directinput=0,directmusic=0,directshow=0,directplay=0,vcrun2010=0,wmdecoder=0,opengl=0")
     }
@@ -1165,14 +1000,12 @@ private val CONFIG_DEFAULTS = linkedMapOf(
     "entityShadowFadeScale" to "\"0\"",
     "refraction" to "\"0\"",
     "groundEffectDensity" to "\"16\"",
-    "GamePadEnable" to "\"1\"",
-    "InputDeviceInterfaceStyle" to "\"1\"",
     // Answers the first-run Screen Narrator prompt, which otherwise blocks login.txt auto-login.
     "showScreenNarrationDialog" to "\"0\"",
     "accessibilityScreenNarrationEnabled" to "\"0\"",
 )
 
-private fun ensureGameConfig(root: File, screenSize: String) {
+private fun ensureGameConfig(root: File, resolution: String) {
     val flavorDir = File(root, FLAVOR_DIR)
     flavorDir.mkdirs()
     val flavorInfo = File(flavorDir, ".flavor.info")
@@ -1181,8 +1014,8 @@ private fun ensureGameConfig(root: File, screenSize: String) {
     }
     // Handheld defaults are only written on first boot so in-game changes stick, with three exceptions.
     // gxApi is always forced: DXVK only works with D3D11, and a config copied from a Mac would otherwise
-    // select Metal. Resolutions are reset when missing or no longer fitting the screen (e.g. after a fold
-    // or unfold): WoW's "auto" otherwise picks a 720p size because it sees a low-end Intel GPU via Wine.
+    // select Metal. Resolutions are reset whenever they differ from the one picked in the launcher: WoW's
+    // "auto" otherwise picks a 720p size because it sees a low-end Intel GPU via Wine.
     // A missing portal is set to the install's region; without the Battle.net app to supply it, WoW
     // otherwise stops at a region picker before login.
     val configWtf = File(flavorDir, "WTF/Config.wtf")
@@ -1196,7 +1029,7 @@ private fun ensureGameConfig(root: File, screenSize: String) {
     }
     if (!configWtf.exists()) {
         configWtf.parentFile?.mkdirs()
-        val defaults = CONFIG_DEFAULTS + RESOLUTION_KEYS.associateWith { "\"$screenSize\"" }
+        val defaults = CONFIG_DEFAULTS + RESOLUTION_KEYS.associateWith { "\"$resolution\"" }
         configWtf.writeText(defaults.entries.joinToString("\n") { "SET ${it.key} ${it.value}" } + "\n")
     }
 
@@ -1205,11 +1038,11 @@ private fun ensureGameConfig(root: File, screenSize: String) {
     val portal = "SET portal \"${portalOf(root)}\"".takeIf { original.none { it.startsWith("SET portal ", ignoreCase = true) } }
     val staleResolutionKeys = RESOLUTION_KEYS.filter { key ->
         val line = original.firstOrNull { it.startsWith("SET $key ", ignoreCase = true) }
-        line == null || !fitsScreen(line.substringAfter(" ").substringAfter(" ").trim('"'), screenSize)
+        line == null || line.substringAfter(" ").substringAfter(" ").trim('"') != resolution
     }
     val updated = original.filterNot { line ->
         line.startsWith("SET gxApi ", ignoreCase = true) || staleResolutionKeys.any { line.startsWith("SET $it ", ignoreCase = true) }
-    } + gxApi + staleResolutionKeys.map { "SET $it \"$screenSize\"" } + listOfNotNull(portal)
+    } + gxApi + staleResolutionKeys.map { "SET $it \"$resolution\"" } + listOfNotNull(portal)
     if (original.none { it == gxApi } || staleResolutionKeys.isNotEmpty() || portal != null) {
         configWtf.writeText(updated.joinToString("\n") + "\n")
     }

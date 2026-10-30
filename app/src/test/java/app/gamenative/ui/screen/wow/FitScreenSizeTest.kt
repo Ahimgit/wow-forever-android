@@ -49,4 +49,22 @@ class FitScreenSizeTest {
         assertFalse(fitsScreen("1206x764", "1104x834"))
         assertFalse(fitsScreen("auto", "1104x834"))
     }
+
+    @Test
+    fun resolutionOptions_followAspectUpToNative() {
+        val expected = listOf("1148x720", "1276x800", "1436x900", "1724x1080", "1914x1200", "2298x1440", "2400x1504")
+        assertEquals(expected, Resolution.options(2400, 1504))
+        assertEquals(expected, Resolution.options(1504, 2400))
+    }
+
+    @Test
+    fun resolutionResolve_usesPickedSizeForCurrentAspect() {
+        assertEquals("1724x1080", Resolution.resolve("1724x1080", "1920x1080", 2400, 1504))
+    }
+
+    @Test
+    fun resolutionResolve_fallsBackToAutoForAutoOrOtherAspect() {
+        assertEquals("1104x834", Resolution.resolve(Resolution.AUTO, "1280x720", 2448, 1848))
+        assertEquals("1104x834", Resolution.resolve("1724x1080", "1280x720", 2448, 1848))
+    }
 }
